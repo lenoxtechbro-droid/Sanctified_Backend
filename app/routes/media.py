@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -20,7 +21,13 @@ router = APIRouter()
 def _sanitize_filename(name: str) -> str:
     base = os.path.basename(name or "upload")
     base = base.replace("\\", "_").replace("/", "_").strip()
-    if not base:
+    # Remove emojis and any non-ASCII characters that Supabase rejects in object paths
+    base = base.encode("ascii", errors="ignore").decode("ascii")
+    # Replace characters not safe for URL paths (keep alphanumeric, dots, dashes, underscores)
+    base = re.sub(r"[^\w.\-]", "_", base)
+    # Collapse multiple underscores / strip leading-trailing underscores
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base or base == ".":
         return "upload"
     return base
 
@@ -51,7 +58,7 @@ def _upload_to_supabase_storage_sync(
     with httpx.Client(
         base_url=storage_base,
         headers=headers,
-        timeout=60.0,
+        timeout=300.0,  # 5 minutes — generous timeout for large audio/video files
         follow_redirects=True,
     ) as client:
         # Create bucket if missing (ignore 4xx e.g. already exists)
@@ -68,10 +75,12 @@ def _upload_to_supabase_storage_sync(
         except Exception:
             pass
 
-        # Upload: POST /object/{bucket}/{path} with multipart file
+        # Upload: POST /object/{bucket}/{path} with raw binary body + Content-Type header.
+        # NOTE: Multipart form encoding (files={}) causes 400 errors on Supabase for large
+        # or binary files. Always send raw bytes with explicit Content-Type instead.
         obj_path = f"/object/{bucket}/{path}"
-        files = {"file": (path.rsplit("/", 1)[-1], data, content_type)}
-        resp = client.post(obj_path, files=files)
+        upload_headers = {"Content-Type": content_type}
+        resp = client.post(obj_path, content=data, headers=upload_headers)
         resp.raise_for_status()
 
     if settings.supabase_media_public:
